@@ -1,0 +1,290 @@
+name: RAGAS Evaluation
+
+# ── Triggers ─────────────────────────────────────────────────────────────────
+on:
+  push:
+    branches: [main, master]   # Run on every merge to main
+  workflow_dispatch:            # Allow manual trigger from GitHub UI
+    inputs:
+      mode:
+        description: "Evaluation mode: retrieval | generation | all"
+        required: false
+        default: retrieval
+      top_k:
+        description: "Number of chunks to retrieve per question"
+        required: false
+        default: "5"
+
+# Never cancel an in-flight eval — partial results are misleading
+concurrency:
+  group: ragas-eval-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 1: Retrieval Evaluation  (always runs — no AWS required)
+  #
+  # Uses:
+  #   • OpenSearch Docker service as the vector/search backend
+  #   • Deterministic pseudo-random vectors (no Bedrock embedding calls)
+  #   • RAGAS NonLLMContextPrecisionWithReference + NonLLMContextRecall
+  # ────────────────────────────────────────────────────────────────────────────
+  retrieval-eval:
+    name: "Retrieval Eval (NonLLM Metrics)"
+    runs-on: ubuntu-latest
+
+    # OpenSearch Docker service — reachable at localhost:9200 from the runner
+    services:
+      opensearch:
+        image: opensearchproject/opensearch:2.12.0
+        env:
+          discovery.type: single-node
+          plugins.security.disabled: "true"
+          DISABLE_INSTALL_DEMO_CONFIG: "true"
+          OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
+        ports:
+          - 9200:9200
+        options: >-
+          --health-cmd "curl -sf http://localhost:9200/_cluster/health || exit 1"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-eval-${{ hashFiles('requirements.txt', 'requirements-eval.txt') }}
+          restore-keys: pip-eval-
+
+      - name: Install dependencies
+        run: |
+          pip install --no-cache-dir \
+            -r requirements.txt \
+            -r requirements-eval.txt
+
+      - name: Wait for OpenSearch
+        run: |
+          echo "Waiting for OpenSearch to be ready..."
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:9200/_cluster/health; then
+              echo "OpenSearch is ready."
+              break
+            fi
+            echo "Attempt $i/30 — retrying in 5s..."
+            sleep 5
+          done
+
+      - name: Run retrieval evaluation
+        env:
+          # OpenSearch — plain HTTP, no auth (Docker service)
+          OPENSEARCH_HOST: localhost
+          OPENSEARCH_PORT: "9200"
+          OPENSEARCH_USE_SSL: "false"
+          OPENSEARCH_SERVICE: es
+          # App config defaults (no real AWS resources needed for retrieval eval)
+          AWS_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_DEFAULT_REGION: us-east-1
+          S3_BUCKET: eval-bucket
+          AUDIT_LOG_BUCKET: ""
+          BEDROCK_MODEL_ID: test-model-id
+          BEDROCK_EMBED_MODEL_ID: test-embed-model
+          EMBED_DIMENSIONS: "1024"
+          CHUNK_SIZE: "512"
+          CHUNK_OVERLAP: "50"
+        run: |
+          python -m evals.run_evals \
+            --mode retrieval \
+            --top-k ${{ github.event.inputs.top_k || '5' }} \
+            --output retrieval-eval-report.json
+
+      - name: Upload retrieval report
+        uses: actions/upload-artifact@v4
+        if: always()       # Upload even on failure so the report is inspectable
+        with:
+          name: retrieval-eval-report-${{ github.sha }}
+          path: retrieval-eval-report.json
+          retention-days: 30
+
+      - name: Print score summary
+        if: always()
+        run: |
+          echo "──── Retrieval Evaluation Scores ────"
+          python - <<'EOF'
+          import json, sys
+          try:
+              r = json.load(open("retrieval-eval-report.json"))
+              print(f"Mode: {r['mode']}")
+              print(f"Passed: {r['passed']}")
+              for k, v in r.get("all_scores", {}).items():
+                  print(f"  {k}: {v:.4f}")
+              if r.get("failures"):
+                  print("\nFailed metrics:")
+                  for f in r["failures"]:
+                      print(f"  {f}")
+          except Exception as e:
+              print(f"Could not parse report: {e}", file=sys.stderr)
+          EOF
+
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 2: Generation Evaluation  (runs only when AWS credentials are available)
+  #
+  # Uses:
+  #   • OpenSearch Docker service
+  #   • Real AWS Bedrock for QA agent responses (Claude) + RAGAS LLM evaluator
+  #   • RAGAS Faithfulness + ResponseRelevancy + RougeScore
+  #
+  # To enable: add these GitHub Actions secrets to the repository:
+  #   AWS_DEPLOY_ROLE_ARN, AWS_REGION, BEDROCK_MODEL_ID, BEDROCK_EMBED_MODEL_ID
+  # ────────────────────────────────────────────────────────────────────────────
+  generation-eval:
+    name: "Generation Eval (LLM Metrics)"
+    runs-on: ubuntu-latest
+    # Only run when the AWS role secret is present — skip on forks / no-secret PRs
+    if: ${{ vars.ENABLE_GENERATION_EVAL == 'true' || github.event.inputs.mode == 'generation' || github.event.inputs.mode == 'all' }}
+
+    permissions:
+      id-token: write    # Required for OIDC AWS authentication
+      contents: read
+
+    services:
+      opensearch:
+        image: opensearchproject/opensearch:2.12.0
+        env:
+          discovery.type: single-node
+          plugins.security.disabled: "true"
+          DISABLE_INSTALL_DEMO_CONFIG: "true"
+          OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
+        ports:
+          - 9200:9200
+        options: >-
+          --health-cmd "curl -sf http://localhost:9200/_cluster/health || exit 1"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-eval-${{ hashFiles('requirements.txt', 'requirements-eval.txt') }}
+          restore-keys: pip-eval-
+
+      - name: Install dependencies
+        run: |
+          pip install --no-cache-dir \
+            -r requirements.txt \
+            -r requirements-eval.txt
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+
+      - name: Wait for OpenSearch
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:9200/_cluster/health; then
+              echo "OpenSearch ready."
+              break
+            fi
+            sleep 5
+          done
+
+      - name: Run generation evaluation
+        env:
+          OPENSEARCH_HOST: localhost
+          OPENSEARCH_PORT: "9200"
+          OPENSEARCH_USE_SSL: "false"
+          OPENSEARCH_SERVICE: es
+          AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+          BEDROCK_MODEL_ID: ${{ secrets.BEDROCK_MODEL_ID || 'us.anthropic.claude-3-7-sonnet-20250219-v1:0' }}
+          BEDROCK_EMBED_MODEL_ID: ${{ secrets.BEDROCK_EMBED_MODEL_ID || 'amazon.titan-embed-text-v2:0' }}
+          EMBED_DIMENSIONS: "1024"
+          S3_BUCKET: eval-bucket
+          AUDIT_LOG_BUCKET: ""
+          CHUNK_SIZE: "512"
+          CHUNK_OVERLAP: "50"
+        run: |
+          python -m evals.run_evals \
+            --mode generation \
+            --top-k ${{ github.event.inputs.top_k || '5' }} \
+            --output generation-eval-report.json
+
+      - name: Upload generation report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: generation-eval-report-${{ github.sha }}
+          path: generation-eval-report.json
+          retention-days: 30
+
+      - name: Print score summary
+        if: always()
+        run: |
+          echo "──── Generation Evaluation Scores ────"
+          python - <<'EOF'
+          import json, sys
+          try:
+              r = json.load(open("generation-eval-report.json"))
+              print(f"Mode: {r['mode']}")
+              print(f"Passed: {r['passed']}")
+              for k, v in r.get("all_scores", {}).items():
+                  print(f"  {k}: {v:.4f}")
+              if r.get("failures"):
+                  print("\nFailed metrics:")
+                  for f in r["failures"]:
+                      print(f"  {f}")
+          except Exception as e:
+              print(f"Could not parse report: {e}", file=sys.stderr)
+          EOF
+
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 3: Evaluation Gate
+  #
+  # Final required status check that summarises both eval jobs.
+  # Blocks merges if the retrieval evaluation failed.
+  # ────────────────────────────────────────────────────────────────────────────
+  eval-gate:
+    name: "Evaluation Gate"
+    runs-on: ubuntu-latest
+    needs: [retrieval-eval]          # retrieval-eval is always required
+    if: always()
+
+    steps:
+      - name: Check retrieval evaluation result
+        run: |
+          if [ "${{ needs.retrieval-eval.result }}" != "success" ]; then
+            echo "Retrieval evaluation failed or was skipped — blocking merge."
+            exit 1
+          fi
+          echo "Retrieval evaluation passed."
+
+      - name: Report generation eval status (informational)
+        run: |
+          echo "Generation eval status: ${{ needs.generation-eval.result || 'skipped (no AWS credentials)' }}"
+          echo "Note: generation eval is optional and does not block merges."

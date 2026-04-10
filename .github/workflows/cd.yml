@@ -1,0 +1,354 @@
+name: CD
+
+# ── Triggers ──────────────────────────────────────────────────────────────────
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment to deploy (dev | qa | prod)"
+        required: true
+        default: dev
+        type: choice
+        options: [dev, qa, prod]
+      image_tag:
+        description: "Image tag to deploy (default: short SHA of HEAD)"
+        required: false
+        default: ""
+
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false
+
+# ── Required GitHub Repository Variables (Settings → Variables) ───────────────
+# TF_STATE_BUCKET          — e.g. medical-agent-tf-state-123456789
+# TF_LOCK_TABLE            — e.g. medical-agent-tf-lock
+# AWS_REGION               — e.g. us-east-1
+# ECR_APP_IMAGE_URL        — e.g. 123456789.dkr.ecr.us-east-1.amazonaws.com/medical-agent-app
+# ECR_ETL_IMAGE_URL        — e.g. 123456789.dkr.ecr.us-east-1.amazonaws.com/medical-agent-etl
+#
+# Required GitHub Repository Secrets (Settings → Secrets):
+# AWS_DEPLOY_ROLE_ARN_DEV  — IAM role for the dev environment deploy
+# AWS_DEPLOY_ROLE_ARN_QA   — IAM role for the qa environment deploy
+# AWS_DEPLOY_ROLE_ARN_PROD — IAM role for the prod environment deploy
+# BEDROCK_MODEL_ID         — (optional) Bedrock model ID override
+
+env:
+  TF_VERSION:      "1.7.5"
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+  TF_LOCK_TABLE:   ${{ vars.TF_LOCK_TABLE || 'medical-agent-tf-lock' }}
+  AWS_REGION:      ${{ vars.AWS_REGION || 'us-east-1' }}
+
+# ── Reusable job: Terraform apply for one environment ─────────────────────────
+# Called three times (dev → qa → prod) via sequential needs: dependencies.
+# Each call passes a different `environment` matrix value.
+
+jobs:
+
+  # ── 0. Compute shared image tag ───────────────────────────────────────────
+  meta:
+    name: Compute Image Tag
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.tag.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute tag
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.image_tag }}" ]; then
+            TAG="${{ github.event.inputs.image_tag }}"
+          else
+            TAG="${GITHUB_SHA::8}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Using image tag: ${TAG}"
+
+  # ── 1. Build & push Docker images to ECR ─────────────────────────────────
+  build-and-push:
+    name: Build & Push Images
+    runs-on: ubuntu-latest
+    needs: meta
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC — dev role used for ECR push)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN_DEV }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & push app image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: |
+            ${{ vars.ECR_APP_IMAGE_URL }}:${{ needs.meta.outputs.image_tag }}
+            ${{ vars.ECR_APP_IMAGE_URL }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Build & push ETL image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.etl
+          push: true
+          tags: |
+            ${{ vars.ECR_ETL_IMAGE_URL }}:${{ needs.meta.outputs.image_tag }}
+            ${{ vars.ECR_ETL_IMAGE_URL }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Output image URIs
+        run: |
+          echo "App : ${{ vars.ECR_APP_IMAGE_URL }}:${{ needs.meta.outputs.image_tag }}"
+          echo "ETL : ${{ vars.ECR_ETL_IMAGE_URL }}:${{ needs.meta.outputs.image_tag }}"
+
+  # ── 2. Deploy DEV ─────────────────────────────────────────────────────────
+  deploy-dev:
+    name: "Deploy → DEV"
+    runs-on: ubuntu-latest
+    needs: [meta, build-and-push]
+    # Skip if manual trigger targeted a specific non-dev environment
+    if: |
+      github.event_name == 'push' ||
+      github.event.inputs.environment == 'dev' ||
+      github.event.inputs.environment == 'qa' ||
+      github.event.inputs.environment == 'prod'
+    environment:
+      name: dev
+      url: "https://dev.${{ vars.APP_DOMAIN || 'example.com' }}"
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Terraform ${{ env.TF_VERSION }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (OIDC — dev)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN_DEV }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform init (dev)
+        working-directory: terraform/environments/dev
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" \
+            -backend-config="key=environments/dev/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ env.TF_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform plan (dev)
+        working-directory: terraform/environments/dev
+        run: |
+          terraform plan \
+            -var="app_image_tag=${{ needs.meta.outputs.image_tag }}" \
+            -var="etl_image_tag=${{ needs.meta.outputs.image_tag }}" \
+            -var="ecr_app_image_url=${{ vars.ECR_APP_IMAGE_URL }}" \
+            -var="ecr_etl_image_url=${{ vars.ECR_ETL_IMAGE_URL }}" \
+            -out=tfplan \
+            -detailed-exitcode \
+            -no-color
+        id: plan-dev
+
+      - name: Terraform apply (dev)
+        working-directory: terraform/environments/dev
+        if: steps.plan-dev.outputs.exitcode == '2'   # 2 = changes present
+        run: terraform apply -auto-approve tfplan
+
+      - name: Verify AgentCore runtime is READY (dev)
+        run: |
+          RUNTIME_ID=$(terraform -chdir=terraform/environments/dev output -raw agent_runtime_id)
+          echo "AgentCore runtime: $RUNTIME_ID"
+          for i in $(seq 1 20); do
+            STATUS=$(aws bedrock-agentcore get-agent-runtime \
+              --agent-runtime-id "$RUNTIME_ID" \
+              --query 'status' --output text \
+              --region "${{ env.AWS_REGION }}" 2>/dev/null || echo "UNKNOWN")
+            echo "  [$i/20] status: $STATUS"
+            if [ "$STATUS" = "READY" ]; then exit 0; fi
+            if [[ "$STATUS" == *"FAILED"* ]]; then echo "Runtime in failed state"; exit 1; fi
+            sleep 30
+          done
+          echo "Timed out waiting for READY"; exit 1
+
+  # ── 3. Deploy QA ──────────────────────────────────────────────────────────
+  deploy-qa:
+    name: "Deploy → QA"
+    runs-on: ubuntu-latest
+    needs: [meta, deploy-dev]
+    if: |
+      github.event_name == 'push' ||
+      github.event.inputs.environment == 'qa' ||
+      github.event.inputs.environment == 'prod'
+    environment:
+      name: qa
+      url: "https://qa.${{ vars.APP_DOMAIN || 'example.com' }}"
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Terraform ${{ env.TF_VERSION }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (OIDC — qa)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN_QA }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform init (qa)
+        working-directory: terraform/environments/qa
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" \
+            -backend-config="key=environments/qa/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ env.TF_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform plan (qa)
+        id: plan-qa
+        working-directory: terraform/environments/qa
+        run: |
+          terraform plan \
+            -var="app_image_tag=${{ needs.meta.outputs.image_tag }}" \
+            -var="etl_image_tag=${{ needs.meta.outputs.image_tag }}" \
+            -var="ecr_app_image_url=${{ vars.ECR_APP_IMAGE_URL }}" \
+            -var="ecr_etl_image_url=${{ vars.ECR_ETL_IMAGE_URL }}" \
+            -out=tfplan \
+            -detailed-exitcode \
+            -no-color
+
+      - name: Terraform apply (qa)
+        working-directory: terraform/environments/qa
+        if: steps.plan-qa.outputs.exitcode == '2'
+        run: terraform apply -auto-approve tfplan
+
+      - name: Verify AgentCore runtime is READY (qa)
+        run: |
+          RUNTIME_ID=$(terraform -chdir=terraform/environments/qa output -raw agent_runtime_id)
+          echo "AgentCore runtime: $RUNTIME_ID"
+          for i in $(seq 1 20); do
+            STATUS=$(aws bedrock-agentcore get-agent-runtime \
+              --agent-runtime-id "$RUNTIME_ID" \
+              --query 'status' --output text \
+              --region "${{ env.AWS_REGION }}" 2>/dev/null || echo "UNKNOWN")
+            echo "  [$i/20] status: $STATUS"
+            if [ "$STATUS" = "READY" ]; then exit 0; fi
+            if [[ "$STATUS" == *"FAILED"* ]]; then echo "Runtime in failed state"; exit 1; fi
+            sleep 30
+          done
+          echo "Timed out waiting for READY"; exit 1
+
+  # ── 4. Deploy PROD (manual approval gate required) ────────────────────────
+  deploy-prod:
+    name: "Deploy → PROD"
+    runs-on: ubuntu-latest
+    needs: [meta, deploy-qa]
+    if: |
+      github.event_name == 'push' ||
+      github.event.inputs.environment == 'prod'
+    environment:
+      name: prod                  # Configure required reviewers in GitHub Environments
+      url: "https://${{ vars.APP_DOMAIN || 'example.com' }}"
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Terraform ${{ env.TF_VERSION }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (OIDC — prod)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform init (prod)
+        working-directory: terraform/environments/prod
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" \
+            -backend-config="key=environments/prod/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ env.TF_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform plan (prod)
+        id: plan-prod
+        working-directory: terraform/environments/prod
+        run: |
+          terraform plan \
+            -var="app_image_tag=${{ needs.meta.outputs.image_tag }}" \
+            -var="etl_image_tag=${{ needs.meta.outputs.image_tag }}" \
+            -var="ecr_app_image_url=${{ vars.ECR_APP_IMAGE_URL }}" \
+            -var="ecr_etl_image_url=${{ vars.ECR_ETL_IMAGE_URL }}" \
+            -out=tfplan \
+            -detailed-exitcode \
+            -no-color
+
+      - name: Terraform apply (prod)
+        working-directory: terraform/environments/prod
+        if: steps.plan-prod.outputs.exitcode == '2'
+        run: terraform apply -auto-approve tfplan
+
+      - name: Verify AgentCore runtime is READY (prod)
+        run: |
+          RUNTIME_ID=$(terraform -chdir=terraform/environments/prod output -raw agent_runtime_id)
+          echo "AgentCore runtime: $RUNTIME_ID"
+          for i in $(seq 1 20); do
+            STATUS=$(aws bedrock-agentcore get-agent-runtime \
+              --agent-runtime-id "$RUNTIME_ID" \
+              --query 'status' --output text \
+              --region "${{ env.AWS_REGION }}" 2>/dev/null || echo "UNKNOWN")
+            echo "  [$i/20] status: $STATUS"
+            if [ "$STATUS" = "READY" ]; then exit 0; fi
+            if [[ "$STATUS" == *"FAILED"* ]]; then echo "Runtime in failed state"; exit 1; fi
+            sleep 30
+          done
+          echo "Timed out waiting for READY"; exit 1
+
+      - name: Tag commit as released to prod
+        run: |
+          git tag "release-${{ needs.meta.outputs.image_tag }}"
+          git push origin "release-${{ needs.meta.outputs.image_tag }}"

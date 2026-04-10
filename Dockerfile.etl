@@ -1,0 +1,35 @@
+# ── Stage 1: dependency builder ───────────────────────────────────────────────
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+
+# ── Stage 2: ETL runtime image ────────────────────────────────────────────────
+FROM python:3.11-slim AS runtime
+
+WORKDIR /app
+
+COPY --from=builder /install /usr/local
+
+COPY agents/   agents/
+COPY config/   config/
+COPY etl/      etl/
+COPY tools/    tools/
+COPY utils/    utils/
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app
+
+RUN adduser --disabled-password --gecos "" etluser
+USER etluser
+
+# python -m etl.run_etl [--domain <domain>] [--recreate]
+ENTRYPOINT ["python", "-m", "etl.run_etl"]
