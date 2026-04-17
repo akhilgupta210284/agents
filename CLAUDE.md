@@ -1,150 +1,139 @@
-# CLAUDE.md — Medical Document Intelligence Multi-Agent App
+# CLAUDE.md
 
-## Project Overview
-
-A HIPAA/GDPR-compliant medical RAG (Retrieval-Augmented Generation) system built with:
-- **Strands Agents** framework + AWS Bedrock (Claude 3.7 Sonnet, Titan Embed v2)
-- **Amazon Bedrock AgentCore Runtime** — managed serverless runtime for the agent (replaced ECS Fargate for the app)
-- **OpenSearch** with hybrid search (BM25 lexical + KNN semantic, merged via Reciprocal Rank Fusion)
-- **4 document domains**: disease study, medicine study, medicine expiry, equipment study
-- **RAGAS** evaluation framework for retrieval and generation quality
-- **Terraform** infrastructure (dev / qa / prod) deployed via GitHub Actions CI/CD
-
----
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Local Environment
 
-- **OS**: Windows 11, shell: bash (use Unix syntax — forward slashes, not backslashes)
+- **OS**: Windows 11, shell: bash — use Unix syntax (forward slashes, not backslashes)
 - **Python**: 3.14.3 — always use `.venv/Scripts/python`, never bare `python` or `python3`
 - **pip**: always use `.venv/Scripts/python -m pip`, never bare `pip`
 - **Docker**: NOT installed — integration tests and RAGAS retrieval eval require Docker Desktop
-- **AWS**: credentials active (account 686019146554, user `akhil`), Bedrock + S3 access available
 
----
+## Commands
 
-## Commands — always run from project root
+All commands run from the project root.
 
 ```bash
-# Unit tests (no Docker needed)
+# Unit tests (no external services)
 .venv/Scripts/python -m pytest tests/unit -v
 
-# Integration tests (requires OpenSearch via Docker)
+# Run a single test file
+.venv/Scripts/python -m pytest tests/unit/test_search_tools.py -v
+
+# Run a single test by name
+.venv/Scripts/python -m pytest tests/unit/test_logger.py::TestAudit::test_mask_phi -v
+
+# Integration tests (requires OpenSearch at localhost:9200 via Docker)
 docker compose up opensearch -d
 .venv/Scripts/python -m pytest tests/integration -m integration -v
 
 # Linting
 .venv/Scripts/python -m ruff check .
 
-# RAGAS retrieval eval (requires OpenSearch via Docker)
-.venv/Scripts/python -m evals.run_evals --mode retrieval
+# ETL — index documents from S3 into OpenSearch
+.venv/Scripts/python -m etl.run_etl                          # all domains
+.venv/Scripts/python -m etl.run_etl --domain disease_study   # single domain
+.venv/Scripts/python -m etl.run_etl --recreate               # drop + rebuild indices
 
-# RAGAS generation eval (requires AWS Bedrock)
-.venv/Scripts/python -m evals.run_evals --mode generation
+# RAGAS evals
+.venv/Scripts/python -m evals.run_evals --mode retrieval     # no Bedrock needed
+.venv/Scripts/python -m evals.run_evals --mode generation    # requires Bedrock credentials
+.venv/Scripts/python -m evals.run_evals --mode all           # writes eval-report.json
 
-# Full RAGAS eval (retrieval + generation)
-.venv/Scripts/python -m evals.run_evals --mode all
-
-# Run the app (interactive mode — requires OpenSearch)
+# Run locally (CLI — not the deployed entry point)
 .venv/Scripts/python main.py
+.venv/Scripts/python main.py --query "What are the side effects of ibuprofen?"
 
-# Install/refresh dependencies
+# Test the AgentCore entry point locally (starts HTTP server on port 8080)
+.venv/Scripts/python agentcore_app.py
+curl -X POST http://localhost:8080/invocations -H "Content-Type: application/json" \
+  -d '{"prompt": "Summarize the disease study", "user_id": "test"}'
+
+# Install dependencies
 .venv/Scripts/python -m pip install -r requirements.txt
 .venv/Scripts/python -m pip install -r requirements-test.txt
 ```
 
----
+## Architecture
 
-## Project Structure
+### Request flow
 
 ```
-multi-agent/
-├── agentcore_app.py             # AgentCore Runtime entry point — BedrockAgentCoreApp on port 8080
-├── main.py                      # Local CLI entry point (interactive + single-shot modes, not deployed)
-├── config/settings.py           # All config via os.getenv(), loads .env via python-dotenv
-├── agents/
-│   ├── orchestrator.py          # build_orchestrator() — main Strands agent
-│   ├── summarizer_agent.py
-│   ├── qa_agent.py
-│   └── question_gen_agent.py
-├── tools/search_tools.py        # _rrf_merge(), _hybrid_search(), 4 @tool functions
-├── etl/
-│   ├── document_processor.py    # Word-level sliding window chunker
-│   ├── opensearch_indexer.py    # create_index(), index_chunks(), _embed()
-│   ├── s3_reader.py             # read_domain_documents(), PDF via pdfplumber
-│   └── run_etl.py               # ETL entry point
-├── utils/
-│   ├── logger.py                # audit(), _mask_phi() — PHI masking (SSN/email/phone)
-│   └── compliance.py            # check_domain_access(), strip_sensitive_metadata()
-├── evals/
-│   ├── golden_dataset.py        # 12-entry corpus + 12 Q&A SAMPLES with reference_contexts
-│   ├── seed_index.py            # Deterministic vectors (SHA-256), no Bedrock needed
-│   ├── retrieval_eval.py        # NonLLMContextPrecision + NonLLMContextRecall
-│   ├── generation_eval.py       # Faithfulness + ResponseRelevancy + RougeScore
-│   └── run_evals.py             # CLI entry point, writes eval-report.json
-├── tests/
-│   ├── conftest.py              # Injects safe env defaults BEFORE any app import
-│   ├── unit/                    # No external services needed
-│   └── integration/             # Requires OpenSearch at localhost:9200
-├── terraform/
-│   ├── shared/                  # S3 state, DynamoDB lock, ECR repos, GitHub OIDC
-│   ├── modules/                 # networking, iam, s3, opensearch, agentcore, ecs (ETL only)
-│   └── environments/            # dev / qa / prod — each has backend.tf + tfvars
-├── .github/workflows/
-│   ├── ci.yml                   # lint → unit → integration → docker-build → tf-validate → tf-plan
-│   ├── cd.yml                   # meta → build-push → deploy-dev → deploy-qa → deploy-prod
-│   └── ragas-eval.yml           # retrieval-eval → generation-eval → eval-gate
-├── Dockerfile                   # App image (multi-stage, non-root appuser)
-├── Dockerfile.etl               # ETL image
-├── docker-compose.yml           # OpenSearch + optional dashboards, etl, app profiles
-├── requirements.txt
-├── requirements-test.txt
-├── pytest.ini
-└── .env                         # Local overrides (not committed)
+User → agentcore_app.py (@app.entrypoint)
+         └─→ Orchestrator (agents/orchestrator.py)
+                 ├─→ summarizer tool  → build_summarizer_agent()
+                 ├─→ qa tool          → build_qa_agent()
+                 └─→ question_generator tool → build_question_gen_agent()
+                         │  (all sub-agents have)
+                         └─→ ALL_SEARCH_TOOLS (tools/search_tools.py)
+                                 └─→ _hybrid_search() → OpenSearch (BM25 + KNN via RRF)
+                                         └─→ _embed_query() → Bedrock Titan Embed v2
 ```
 
----
+**Critical pattern**: Sub-agents (`build_qa_agent()`, etc.) are instantiated **fresh on every orchestrator tool call** — this is intentional for HIPAA multi-tenant isolation (no cross-request state leakage).
+
+### Two entry points
+
+| File | Used when |
+|---|---|
+| `agentcore_app.py` | Deployed to AWS — `BedrockAgentCoreApp` serves `/invocations` on port 8080 |
+| `main.py` | Local development only — interactive CLI, never deployed |
+
+### Search pipeline
+
+`tools/search_tools.py` exports four `@tool`-decorated functions (one per domain), each calling `_hybrid_search()`:
+1. Embeds the query via Bedrock Titan (1024-dim)
+2. Runs BM25 lexical search against the `text` field
+3. Runs KNN semantic search against the `vector` field (HNSW/Faiss)
+4. Merges results with Reciprocal Rank Fusion (`k=60`)
+
+The four domain tools are bundled as `ALL_SEARCH_TOOLS` and given to each sub-agent.
+
+### OpenSearch client
+
+`get_opensearch_client()` in `etl/opensearch_indexer.py` uses `AWSV4SignerAuth` with `boto3.Session().get_credentials()`. Set `OPENSEARCH_SERVICE=aoss` for serverless. Both the ETL and search tools use this same factory.
+
+### Configuration
+
+All config lives in `config/settings.py` as typed module-level constants loaded via `os.getenv()`. The `.env` file is loaded by `python-dotenv` at import time. The test `conftest.py` sets `os.environ.setdefault()` values **before** any app import — this means `.env` values never override test defaults.
+
+Key env vars: `OPENSEARCH_HOST`, `S3_BUCKET`, `BEDROCK_MODEL_ID`, `BEDROCK_EMBED_MODEL_ID`, `AUDIT_LOG_BUCKET` (set to `""` to disable S3 audit writes locally).
 
 ## Key Rules
 
 ### Testing
-- Always run unit tests before any code change: `.venv/Scripts/python -m pytest tests/unit -v`
-- `tests/conftest.py` sets safe defaults via `os.environ.setdefault()` — these win over `.env` during pytest
-- Unit tests are marked with no marker; integration tests use `@pytest.mark.integration`
-- Do NOT mock OpenSearch in integration tests — they must hit a real instance
 
-### Configuration
-- All config is in `config/settings.py` via `os.getenv()` — never hardcode values
-- `.env` file is the local override; CI/CD uses GitHub Actions `env:` blocks; prod uses ECS task env vars injected by Terraform
-- `AUDIT_LOG_BUCKET=""` disables real S3 audit writes (safe for local dev and unit tests)
+- `tests/conftest.py` must remain the **first** thing pytest loads — never import app modules at the top of test files before conftest runs
+- Unit tests: no marker; integration tests: `@pytest.mark.integration`
+- Do NOT mock OpenSearch in integration tests — they must hit a real instance at `localhost:9200`
 
 ### Compliance (HIPAA/GDPR)
-- PHI masking is in `utils/logger.py::_mask_phi()` — covers SSN, email, phone, patient IDs
-- Audit logs use KMS encryption and S3 Object Lock (COMPLIANCE mode) in prod
-- Do NOT add logging that could expose PHI — always route through `audit()` or `_mask_phi()`
+
+- All logging must go through `audit()` or `_mask_phi()` in `utils/logger.py` — never log raw query strings directly
+- `check_domain_access(role, domain)` in `utils/compliance.py` is the RBAC gate — call it before returning search results in new tools
+- `AUDIT_LOG_BUCKET=""` disables real S3 writes (safe for local dev and unit tests)
 - `data_retention_days=2555` (7 years) in prod — HIPAA minimum
 
 ### Terraform
-- Do NOT touch `terraform/shared/` without explicit user confirmation — it holds S3 state bucket and ECR repos with `prevent_destroy=true`
-- Each environment (dev/qa/prod) has its own IAM role (`AWS_DEPLOY_ROLE_ARN_DEV/QA/PROD`) — never share roles across envs
-- Backend config is passed via `-backend-config` flags in CI/CD, not stored in `.tf` files
-- Terraform version pinned to `1.7.5`
+
+- Do NOT touch `terraform/shared/` without explicit user confirmation — it holds the S3 state bucket and ECR repos with `prevent_destroy=true`
 - AWS provider pinned to `~> 6.18` (required for `aws_bedrockagentcore_agent_runtime`)
-- The `agentcore` module provisions the agent runtime; the `ecs` module now handles only the ETL batch job
+- The `agentcore` module provisions the agent runtime; `ecs` module handles only the ETL batch job
+- Each environment has its own IAM role (`AWS_DEPLOY_ROLE_ARN_DEV/QA/PROD`) — never share roles across envs
+- Backend config passed via `-backend-config` flags in CI/CD, not stored in `.tf` files
 
 ### RAGAS Evaluations
-- Retrieval eval uses deterministic fake vectors (SHA-256 seeded) — no Bedrock needed
-- Generation eval requires real Bedrock credentials
-- Eval indices are named `eval-medical-*` — separate from production indices
-- Thresholds: context_precision ≥ 0.50, context_recall ≥ 0.40, faithfulness ≥ 0.70, response_relevancy ≥ 0.60, rouge_score ≥ 0.15
-- Report is written to `eval-report.json` after each run
+
+- Retrieval eval monkey-patches `_embed_query` with a SHA-256 deterministic fake — no Bedrock calls, no Docker required if you provide your own OpenSearch
+- Eval indices are prefixed `eval-medical-*` — always separate from production indices
+- Thresholds (in `run_evals.py`): context_precision ≥ 0.50, context_recall ≥ 0.40, faithfulness ≥ 0.70, response_relevancy ≥ 0.60, rouge_score ≥ 0.15
 
 ### CI/CD
-- CI runs on every push and PR to `main`/`master`
-- CD deploys sequentially: dev → qa → prod (prod requires manual approval in GitHub Environments)
-- GitHub OIDC is used for AWS auth — no static AWS keys stored in secrets (except deploy role ARNs)
-- `ENABLE_GENERATION_EVAL` repo variable must be set to `"true"` to enable generation eval in CI
 
----
+- CI: lint → unit tests → integration → docker-build → tf-validate → tf-plan (every push/PR to `main`/`master`)
+- CD: dev → qa → prod sequentially; prod requires manual approval in GitHub Environments
+- GitHub OIDC for AWS auth — no static keys; deploy role ARNs stored as secrets
+- Set repo variable `ENABLE_GENERATION_EVAL=true` to enable generation eval in CI
 
 ## OpenSearch Index Names
 
@@ -154,17 +143,15 @@ multi-agent/
 | Medicine Study | `medical-medicine-study` |
 | Medicine Expiry | `medical-medicine-expiry` |
 | Equipment Study | `medical-equipment-study` |
-| RAGAS Eval (all) | `eval-medical-*` |
+| RAGAS Eval | `eval-medical-*` |
 
----
-
-## GitHub Actions Secrets & Variables Required
+## GitHub Actions Secrets & Variables
 
 | Name | Type | Description |
 |---|---|---|
-| `AWS_DEPLOY_ROLE_ARN_DEV` | Secret | IAM role ARN for dev deploys |
-| `AWS_DEPLOY_ROLE_ARN_QA` | Secret | IAM role ARN for qa deploys |
-| `AWS_DEPLOY_ROLE_ARN_PROD` | Secret | IAM role ARN for prod deploys |
+| `AWS_DEPLOY_ROLE_ARN_DEV` | Secret | IAM role ARN for dev |
+| `AWS_DEPLOY_ROLE_ARN_QA` | Secret | IAM role ARN for qa |
+| `AWS_DEPLOY_ROLE_ARN_PROD` | Secret | IAM role ARN for prod |
 | `TF_STATE_BUCKET` | Variable | S3 bucket for Terraform state |
 | `TF_LOCK_TABLE` | Variable | DynamoDB table for Terraform locks |
 | `AWS_REGION` | Variable | e.g. `us-east-1` |
